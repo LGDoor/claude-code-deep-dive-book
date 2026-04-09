@@ -231,6 +231,19 @@ A notable design choice is that background work is still visible through the sam
 
 This keeps asynchronous work understandable from the user's point of view.
 
+## Not every worker signal goes to the same place
+
+One reason this topic can feel blurry is that Claude Code deliberately uses several visibility channels for the same worker.
+
+| Channel | Main consumer | Typical artifact |
+| --- | --- | --- |
+| **Worker transcript** | recovery, inspection, deep debugging | subagent/session transcript files |
+| **Task output** | task polling, status retrieval, later fetch | task handle plus output path or captured result |
+| **Coordinator notification** | the supervising thread | structured `<task-notification>` result messages |
+| **Mailbox traffic** | teammates and permission coordination | team inbox files and related request/response artifacts |
+
+The point is not to duplicate information needlessly, but to project the same work at different levels. Intermediate worker chatter can stay out of the parent transcript while final results still become visible to the coordinator and retrievable through the task/session layer.
+
 ## Worktrees and isolation
 
 Worktree support is a good example of how operational concerns become part of session identity. A session may not just represent "a prompt history" but "a prompt history tied to a particular isolated repository workspace."
@@ -249,6 +262,30 @@ Worktrees effectively extend the session model into repository topology. They he
 Worktree handling is easy to think of as a git convenience feature, but architecturally it is part of session isolation. It changes the effective workspace, the identity of some persisted state, and the safety of concurrent experimentation.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified persistence and recovery path looks like this:
+
+```ts
+await saveSession({
+  transcript,
+  meta: { mode, title, worktree, parentSessionId },
+  tasks,
+  subagents,
+})
+
+const restored = await loadSession(sessionId)
+const messages = rebuildConversation(restored.transcript, restored.meta)
+
+registerBackgroundTask({
+  id: taskId,
+  parentSessionId: sessionId,
+  kind: 'agent',
+})
+```
+
+The actual session layer uses more sidecar files and recovery helpers than this sketch shows, but the basic idea is visible: Claude Code persists both the transcript and the metadata needed to restore meaning, then ties background work back into that same durable session identity.
 
 ### The transcript is not the whole session
 

@@ -12,7 +12,7 @@ The query engine is where Claude Code's main ideas converge:
 - context compaction
 - transcript persistence
 
-If the CLI is the control plane, this chapter covers the execution core.
+The CLI is the control plane, but the execution core sits underneath it.
 
 ## Core implementation surfaces
 
@@ -112,34 +112,9 @@ This matters because retries, compaction, tool continuations, and stop condition
 
 ## Prompt and context assembly
 
-The system prompt is assembled from several sources:
+At the query-engine level, prompt assembly matters because every loop iteration needs a request envelope that matches the current messages, visible tools, mode posture, and policy state. The engine therefore recomputes model-facing context before each model call instead of treating the prompt as a one-time session prelude.
 
-- stable base sections
-- dynamic runtime sections
-- feature- and mode-specific additions
-- optional custom or appended prompts
-- tool and MCP visibility information
-- model-specific capability shaping
-
-The architecture treats prompt composition as a cache-sensitive operation. Stable prompt sections are intentionally separated from dynamic ones so server-side or client-side caching remains useful.
-
-## Context assembly as a negotiation
-
-Building context is not simply concatenating old messages. The runtime has to negotiate among:
-
-- what the model should still see
-- what the user expects the session to remember
-- what the tool surface currently is
-- what the current mode or policy posture allows
-- what the context window can actually hold
-
-This is why context assembly and compaction are closely related rather than separate afterthoughts.
-
-## Cacheability as an architectural concern
-
-Claude Code treats prompt stability almost like an infrastructure feature. Tool ordering, system-prompt sectioning, feature headers, and some mode latches all exist partly to avoid unnecessary churn in the final request envelope.
-
-This is unusual in normal application code, but it makes sense in a system where repeated prompt construction has direct latency and cost consequences.
+That recomputation is also budget-sensitive. The runtime is always balancing continuity against context-window pressure, which is why compaction sits inside the turn loop rather than after it. Chapter 3 covers the prompt stack, memory layers, and cache discipline in depth; the point here is narrower: context assembly is one of the loop's core state transitions.
 
 ## Streaming model
 
@@ -182,6 +157,24 @@ Claude Code treats tool use as a first-class continuation of the same turn. Once
 4. the model is given the updated state and continues
 
 This keeps tool usage inside the same conversational logic instead of treating it as an external side quest.
+
+## One tool result through the architecture
+
+One of Claude Code's most important runtime handoffs happens after a tool request appears.
+
+1. the input pipeline has already turned the user's submission into user messages and attachments
+2. `QueryEngine` appends those messages to session state and records them before the query loop runs
+3. the query loop streams assistant content until a `tool_use` block appears
+4. tool orchestration executes the request and maps the result into user-role tool-result messages or related artifacts
+5. `QueryEngine` yields those messages to the UI and persists them as transcript entries while the turn is still in progress
+6. the normalized tool-result messages become part of the next loop iteration's message state, so the model continues from structured execution facts rather than from raw hidden side effects
+
+A tool result is simultaneously:
+
+- the output of a capability
+- a conversation artifact for the next model call
+- a persisted transcript entry for resume and recovery
+- a user-visible event in the live session
 
 ## Retries and fallback
 
@@ -226,7 +219,7 @@ The query engine therefore acts partly as a translation layer between internal c
 
 Long-running sessions eventually collide with context limits. Claude Code responds with multiple history-shaping techniques rather than one generic summary step.
 
-This chapter focuses on compaction as it behaves inside the active turn loop. Chapter 3 returns to the same subsystem from the perspective of memory, prompt assets, and long-lived context design.
+Here the emphasis is compaction inside the active turn loop. The same machinery also shapes longer-lived memory surfaces and prompt assets.
 
 The compaction family includes ideas such as:
 
@@ -277,6 +270,30 @@ Likewise, microcompact is not a single operation. In practice, it can include:
 
 This is why compaction in Claude Code is better understood as **context management** than as mere summarization.
 
+## The compaction path uses its own prompt family
+
+When Claude Code compacts history, it does not ask the ordinary coding persona to "summarize a bit." It switches to a separate prompt family whose voice is intentionally strict and narrow. The opening preamble says:
+
+```text
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+```
+
+The body of the prompt then switches from "help the user code" to "produce a durable continuation artifact":
+
+```text
+Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
+```
+
+The same family includes partial-compaction variants, but they preserve the same basic contract: no tools, explicit structure, and a summary designed for later re-entry into live work. This is important because compaction is not a cosmetic recap. It is a state-reduction step that has to preserve enough operational truth for the next turn to remain valid.
+
+Another revealing detail is the required output shape. Claude Code asks the summarizer to emit an `<analysis>` block followed by a `<summary>` block, then strips the `<analysis>` scratch space before reinserting the result into later context. In other words, the compaction prompt deliberately creates a private drafting surface so the summary can be richer than a one-pass compression would usually allow.
+
 ## Session messages as runtime artifacts
 
 The query engine does not just manage prompts and completions. It also normalizes a wider set of message types:
@@ -326,6 +343,29 @@ Claude Code treats a session as an operational trace, not just as a conversation
 This broader message vocabulary is what makes resume, structured output, and delegated work readable to both the user and the system.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified shape of one turn looks like this:
+
+```ts
+while (!turnComplete) {
+  const request = buildModelRequest({
+    systemPrompt,
+    messages,
+    tools,
+  })
+
+  for await (const event of streamModel(request)) {
+    if (event.type === 'assistant_text') appendAssistantText(event)
+    if (event.type === 'tool_use') messages.push(await runTool(event, ctx))
+    if (event.type === 'context_pressure') messages = await compact(messages)
+    if (event.type === 'retryable_error') break
+  }
+}
+```
+
+The real code has more branches for retries, usage accounting, structured output, and compaction variants, but this sketch shows the central idea: one visible turn can contain several internal model/tool cycles before it is truly finished.
 
 ### One visible turn may contain several hidden internal loops
 

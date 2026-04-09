@@ -170,6 +170,47 @@ These modes share code, but they differ in how they:
 
 An important consequence is that Claude Code does not have one universal "main loop" for I/O. It has a shared execution core wrapped by several presentation and transport shells.
 
+## Mode families stack rather than replace one another
+
+Here, **execution mode** means the startup shell or transport posture the process launches into. Claude Code also carries other mode families at the same time.
+
+| Mode family | Typical examples | Main owner |
+| --- | --- | --- |
+| **Execution mode** | interactive, headless, remote/viewer, bridge | startup and shell launch |
+| **Permission mode** | `default`, `plan`, `acceptEdits`, `dontAsk`, `auto`, `bypassPermissions` | permission subsystem |
+| **Prompt identity** | default, custom, agent, coordinator, proactive addendum | prompt assembly |
+| **Session-stable latches** | AFK header latch, fast-mode latch, cache-editing latch, thinking-clear latch | bootstrap state and prompt-cache discipline |
+
+These families are intentionally orthogonal. An interactive session can still carry coordinator prompt identity, a specific permission mode, and several sticky cache latches at the same time. The shared word "mode" therefore covers several distinct switches rather than one global state.
+
+## Some modes change prompt identity, not merely shell behavior
+
+Execution mode is only part of the story. Startup and runtime posture can also change what Claude Code is told it is. The simplest path collapses the prompt to something close to:
+
+```text
+You are Claude Code, Anthropic's official CLI for Claude.
+
+CWD: ...
+Date: ...
+```
+
+Proactive mode adopts a different identity entirely:
+
+```text
+You are an autonomous agent. Use the available tools to do useful work.
+```
+
+It then appends an explicit autonomous-work manual:
+
+```text
+# Autonomous work
+You are running autonomously. You will receive `<tick>` prompts that keep you alive between turns ...
+...
+If you have nothing useful to do on a tick, you MUST call Sleep.
+```
+
+This is an important architectural point. Startup does not only choose a UI shell or transport contract. It may also activate a different prompt personality with different assumptions about initiative, pacing, and user involvement. So the process can be in one **execution mode** while simultaneously carrying a different **prompt identity** and **permission mode**.
+
 ## Mode-specific dependencies
 
 Different modes force startup to resolve different dependencies early:
@@ -279,29 +320,11 @@ This is part of what keeps Claude Code from splitting into several independent a
 
 These shared invariants also make later subsystem chapters easier to understand. The query engine, tool system, and session storage can assume some startup work has already normalized identity, mode, and configuration posture.
 
-## Feature gating and build shape
+## Feature gating at startup
 
-One of the most important architectural choices in startup is heavy use of feature-gated imports. The runtime uses compile-time feature checks to exclude entire product branches from some builds.
+Startup has to reconcile build-time gates with runtime environment. Conditional imports and lazy loading exist so Claude Code can ship different product shapes without forcing every build to carry every mode.
 
-That has several consequences:
-
-- imports are often wrapped in conditional `require` patterns
-- directories such as bridge, daemon, assistant/proactive, or background-session related areas can represent optional product surfaces rather than always-on code
-- startup logic must coordinate both build-time and runtime availability
-
-This makes Claude Code feel larger than any single built artifact.
-
-Chapter 11 returns to this pattern from the operational side and explains why build shape exerts so much pressure on Claude Code's architecture in the first place.
-
-## Why conditional imports are everywhere
-
-The frequent combination of feature checks and lazy imports is not just a bundling trick. It serves three architectural purposes:
-
-1. keep startup fast when a path is irrelevant
-2. remove product-specific code from builds that should not ship it
-3. reduce accidental coupling between optional branches and always-on runtime infrastructure
-
-Once this is understood, a lot of Claude Code's shape becomes easier to read.
+From startup's point of view, the consequence is straightforward: mode selection cannot assume that every optional subsystem exists. The boot path has to discover which branches are compiled in, assemble the runtime from that smaller capability set, and keep irrelevant code unloaded. Chapter 11 returns to the same pattern from the operational and packaging side.
 
 ## Startup as product assembly
 
@@ -333,6 +356,28 @@ flowchart LR
 ```
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified startup flow looks like this:
+
+```ts
+const argv = normalizeArgv(rawArgv)
+
+await init() // safe early bootstrap
+
+const mode = classifyRuntime(argv, env)
+await setup(mode, cwd, settings)
+
+switch (mode) {
+  case 'interactive': return launchRepl()
+  case 'headless': return runStructuredIO()
+  case 'remote': return startRemoteFlow()
+  case 'bridge': return startBridgeHost()
+}
+```
+
+The real startup path contains more fast paths and feature gates, but this sketch shows the architectural split clearly: normalize the invocation, perform trust-safe bootstrap work, decide which product posture this process should become, and only then launch the matching shell.
 
 ### Argument rewriting is part of mode selection
 
@@ -370,7 +415,7 @@ The value of that centralization grows with every additional mode. Once startup 
 
 Claims such as "sessions can be resumed," "headless output is structured," or "remote mode only shows safe commands" only become true because startup enforces the preconditions that make them possible.
 
-This is why the startup layer deserves to be read as product architecture instead of mere bootstrap glue. It is where user-visible guarantees are converted into concrete runtime posture, validated dependencies, and shared state that later chapters rely on.
+This is why the startup layer deserves to be treated as product architecture instead of mere bootstrap glue. It is where user-visible guarantees are converted into concrete runtime posture, validated dependencies, and shared state that the rest of the runtime relies on.
 
 ## Architectural takeaway
 

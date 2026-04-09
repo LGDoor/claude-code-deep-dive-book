@@ -100,7 +100,7 @@ The analytics layer is designed so the rest of the application can emit operatio
 
 **Example:** a startup-time authentication or tool-registration event may occur before the final analytics sink is ready. The runtime can queue it, scrub or classify the metadata, and only later forward a safe operational record instead of either dropping the event or blocking startup on telemetry wiring.
 
-Just as importantly, analytics metadata is treated as a data-governance problem, not just a convenience API. The analytics service distinguishes between ordinary safe metadata, specially tagged values, and proto-only fields that must be stripped before routing events to broader-access sinks. That makes observability safer by construction rather than by convention.
+Just as importantly, analytics metadata is treated as a data-governance problem, not just a convenience API. The analytics service distinguishes between ordinary safe metadata, specially tagged values, and proto-only fields that may be retained only for more restricted sinks and must be stripped before routing events to broader-access destinations. In practice, this can mean that built-in tool families remain named while many MCP-originated tool details are deliberately collapsed into safer buckets, and `_PROTO_*` fields are reserved for tighter-access analytics paths. That makes observability safer by construction rather than by convention.
 
 ## Cost tracking
 
@@ -152,41 +152,28 @@ flowchart LR
   DIAG --> STORE
 ```
 
-## Prompt-cache awareness
+## Prompt-cache stability as an operational constraint
 
-Chapter 3 explains the mechanics of prompt shaping and cache discipline. The emphasis here is narrower: why that discipline matters for operations, latency, and product economics.
+Chapter 3 explains the mechanics of prompt shaping and cache discipline. The operational point is simpler: cache stability affects latency, cost, and product behavior, so Claude Code has to care about it in places that would otherwise look unrelated.
 
-One subtle operational theme is prompt-cache stability. Several parts of Claude Code are designed to avoid unnecessary variation in the model request envelope. That affects:
+That is why the runtime pays attention to:
 
-- system prompt section ordering
-- feature headers
-- tool ordering and visibility
-- compaction behavior
+- system prompt section partitioning and ordering
+- feature headers that stay sticky once introduced
+- tool ordering and visibility stability
+- compaction behavior that preserves useful cache boundaries
 
-This is an example of performance concerns shaping architecture at the boundaries of prompting and state management.
-
-## Cache stability as a design constraint
-
-Once prompt caching is important enough, the runtime has to care about stability in places that would otherwise feel unrelated:
-
-- how system prompt sections are partitioned
-- whether feature headers remain sticky once introduced
-- whether tool ordering changes between turns
-- whether compaction preserves useful cache boundaries
-
-That is a strong example of low-level operational economics influencing high-level architecture.
-
-## Prompt-cache stability as product engineering
-
-Claude Code treats cache stability as a cross-cutting optimization rather than a local implementation detail. That is why seemingly distant areas, such as feature latches in bootstrap state or stable tool ordering, can still be explained in terms of cache behavior.
+This is a clear example of low-level economics pushing on high-level architecture. Prompt-cache reuse is valuable enough that Claude Code treats envelope stability as a cross-cutting operational constraint rather than a local prompt trick.
 
 ## Cache latches turn transient modes into stable request envelopes
 
 One of the more revealing details in `bootstrap/state.ts` is the number of sticky feature latches whose job is to keep prompt-shaping headers stable once a session has crossed a capability boundary.
 
+A **latch** here is simply a sticky boolean in bootstrap state. Once Claude Code has sent a header for a capability class such as AFK/auto mode, fast mode, cache-editing, or thinking clearing, that latch can stay on for the rest of the session so repeated toggles do not keep busting the prompt cache. `/clear` and `/compact` reset those latches and let the next conversation evaluate them again from scratch.
+
 **Example:** if a session briefly enters an auto or AFK-oriented posture, the runtime may keep the related prompt-shaping headers stable even after later local toggles. That can look slightly conservative from a UI perspective, but it preserves a more stable request envelope and therefore better prompt-cache reuse across the rest of the session.
 
-Examples include latches for fast-mode headers, AFK/auto-mode headers, cache-editing behavior, and thinking-clearing posture. These latches show that the runtime is willing to remember operational history in order to keep the prompt envelope stable across later toggles.
+Examples include latches for fast-mode headers, AFK/auto-mode headers, cache-editing behavior, and thinking-clearing posture. The AFK header is especially revealing: once auto/AFK mode first activates, the related beta header can remain latched for later agentic queries even if the user toggles posture locally afterward. These latches show that the runtime is willing to remember operational history in order to keep the prompt envelope stable across later toggles.
 
 That is a subtle but important architectural choice. Instead of representing every mode change as a fresh prompt shape, the system sometimes preserves a broader "session has entered this category" fact so that server-side prompt caches remain useful.
 
@@ -224,6 +211,28 @@ Claude Code therefore has to maintain discipline about what goes where:
 These subsystems are best understood as part of session infrastructure rather than as optional observability extras. They track what happened over the lifetime of a workflow, which fits Claude Code's broader view that a session is a durable unit of work.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified operational cross-section looks like this:
+
+```ts
+const proactiveModule = feature('PROACTIVE')
+  ? require('../proactive/index.js')
+  : null
+
+if (!isAnalyticsDisabled()) {
+  logEvent('query_completed', { sessionId, cost, cacheHit })
+}
+
+const systemPrompt = [
+  staticPrefix,
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+  dynamicSections,
+]
+```
+
+This sketch brings three operational pressures into one place: build gating decides what code ships, observability records what happened during a session, and prompt-cache discipline influences how the request envelope itself is structured.
 
 ### Build gating and runtime gating work together
 

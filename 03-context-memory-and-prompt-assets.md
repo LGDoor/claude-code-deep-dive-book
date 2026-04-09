@@ -2,7 +2,7 @@
 
 ## Why this chapter matters
 
-If Chapter 2 explains the engine that runs a turn, this chapter explains **what the engine is actually made to think with**.
+The execution core only becomes useful once Claude Code decides **what the model should think with**.
 
 Claude Code does not send the model a single monolithic prompt. It assembles a reasoning surface from several different kinds of material:
 
@@ -14,7 +14,7 @@ Claude Code does not send the model a single monolithic prompt. It assembles a r
 - tool and integration descriptions
 - message attachments that carry context outside the main system prompt
 
-This topic deserves its own chapter because it is one of the clearest places where product behavior emerges from architecture. The assistant's quality depends not only on which tools exist, but also on **what context is loaded, how it is prioritized, how long it stays stable, and which parts are allowed to mutate between turns**.
+This subsystem is one of the clearest places where product behavior emerges from architecture. The assistant's quality depends not only on which tools exist, but also on **what context is loaded, how it is prioritized, how long it stays stable, and which parts are allowed to mutate between turns**.
 
 ## Core implementation surfaces
 
@@ -53,6 +53,27 @@ That distinction matters because different context planes have different semanti
 
 This avoids overloading any one prompt surface. Repository guidance like CLAUDE.md does not need to be hard-coded into the main prompt template, and volatile runtime facts do not have to be mixed indiscriminately with durable instruction text.
 
+## A single request is an envelope, not one string
+
+One useful way to visualize the request is as a layered envelope:
+
+```text
+[system prompt sections]
+[system context appended as key: value lines]
+
+<system-reminder>
+# claudeMd
+...
+# currentDate
+...
+</system-reminder>
+
+[ordinary conversation messages]
+[tool schemas whose descriptions also contain instructions]
+```
+
+This architecture matters because each layer has different semantics. The system prompt is the most authoritative behavioral surface. The `<system-reminder>` wrapper carries user- or repository-specific instructions without forcing them into the static prompt prefix. Tool descriptions carry yet another instruction surface: what the model is allowed and expected to do with each capability it sees.
+
 ## Effective prompt selection is layered
 
 `utils/systemPrompt.ts` shows that even the "system prompt" is not singular. The runtime chooses an effective prompt according to a priority ladder:
@@ -66,6 +87,30 @@ This avoids overloading any one prompt surface. Repository guidance like CLAUDE.
 An appended system prompt can still be layered on top afterward.
 
 This priority model is architecturally useful because it lets the product support different personalities without rewriting the rest of the query loop. The execution engine can remain the same while the instruction surface changes substantially.
+
+## The priority ladder is simple enough to quote
+
+A compact way to describe the selection logic is:
+
+```text
+override > coordinator > agent > custom > default
++ appendSystemPrompt unless a full override replaces the stack
+```
+
+That ordering is important because it explains why Claude Code can change identity without changing machinery. A coordinator run, a custom agent run, and an ordinary interactive run may all execute through the same core query loop, yet the top of the instruction stack can differ dramatically. The runtime therefore treats prompt selection as a first-class control-plane decision rather than as a late string substitution.
+
+## Prompt authority is not execution authority
+
+One of the most important distinctions in Claude Code is that prompt layering and runtime permission are related, but not identical.
+
+| Layer | What it decides | Representative mechanism |
+| --- | --- | --- |
+| **Prompt identity** | who Claude Code is acting as | `override > coordinator > agent > custom > default` |
+| **Repository and user guidance** | how Claude Code should behave for this codebase or user | `CLAUDE.md`, local instruction files, managed instructions |
+| **Turn-scoped workflow guidance** | what this one request is trying to do | slash-command prompt text, `initialPrompt`, attachments |
+| **Execution authority** | what actions may actually run | settings, policy-managed configuration, permission rules, sandboxing |
+
+This means a repository instruction can absolutely override the **default assistant behavior** inside the reasoning surface, while still failing to override the runtime's execution boundary. A `CLAUDE.md` file can tell Claude Code to prefer Bash or to use a certain workflow, but it cannot force a blocked tool to run or bypass a sandbox restriction. Chapter 5 picks up that second axis.
 
 ## System prompt sections and cache discipline
 
@@ -94,7 +139,43 @@ The design is explicit about the tradeoff. Most sections are memoized and reused
 - summarize-tool-results guidance
 - feature- or model-specific behavior
 
-This makes the prompt layer behave like a subsystem with policies, caches, and feature gates. A later reader of Claude Code should not think of the system prompt as "just words." It is the model-facing projection of several runtime registries.
+This makes the prompt layer behave like a subsystem with policies, caches, and feature gates. The system prompt is not "just words"; it is the model-facing projection of several runtime registries.
+
+## Representative passages from the default prompt
+
+Several short excerpts reveal what kind of operating manual the default prompt really is. Its opening identity frame begins:
+
+```text
+You are an interactive agent that helps users ...
+IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming.
+```
+
+Its task posture is equally direct:
+
+```text
+# Doing tasks
+- The user will primarily request you to perform software engineering tasks.
+- In general, do not propose changes to code you haven't read.
+- Do not create files unless they're absolutely necessary ...
+```
+
+Its caution model is not hidden inside the permission subsystem; it is stated plainly:
+
+```text
+# Executing actions with care
+
+Carefully consider the reversibility and blast radius of actions...
+```
+
+And its tool strategy is part of the prompt, not merely part of implementation:
+
+```text
+# Using your tools
+- Do NOT use the Bash tool to run commands when a relevant dedicated tool is provided.
+- ... make all independent tool calls in parallel.
+```
+
+These passages are worth quoting because they show that the default prompt is not a generic assistant preamble. It is a compact operational handbook for how Claude Code should behave as a software-engineering agent: what work to do, how to handle risk, and how to think about its toolset.
 
 ## Cache control is part of context architecture
 
@@ -108,6 +189,27 @@ Several mechanisms matter here:
 - cache-break detection and telemetry so the runtime can observe when prompt reuse is being lost
 
 This makes the context subsystem partly economic. The goal is not only to give the model the right information, but also to do so in a way that preserves reuse across long engineering sessions.
+
+## Output styles are prompt patches, not renderer themes
+
+Built-in output styles enter the system prompt as ordinary instruction text. The Explanatory style, for example, adds a section that begins:
+
+```text
+# Output Style: Explanatory
+You are an interactive CLI tool that helps users with software engineering tasks. In addition to software engineering tasks, you should provide educational insights about the codebase along the way.
+```
+
+It then adds an explicit `## Insights` convention that tells Claude Code to frame small educational notes in a recognizable block format. The Learning style goes further by instructing the model to request small human-written code contributions for certain kinds of work:
+
+```text
+## Requesting Human Contributions
+In order to encourage learning, ask the human to contribute 2-10 line code pieces when generating 20+ lines involving:
+- Design decisions
+- Business logic with multiple valid approaches
+- Key algorithms or interface definitions
+```
+
+This is architecturally significant because output style is not a post-processing theme. It changes the model's behavioral instructions directly. A different style means a genuinely different prompt, not merely a different renderer for the same underlying answer.
 
 ## Instruction files and repository guidance
 
@@ -123,6 +225,38 @@ The loading model is explicit:
 4. local private project instructions
 
 Discovery is also path-aware. Project and local files are found by walking upward from the current directory, and files closer to the active working path win by being loaded later. That creates a layered instruction model where the assistant can inherit global rules while still respecting project- and subdirectory-specific guidance.
+
+## External instructions are framed as overrides, then wrapped as context
+
+Claude Code does not merely paste discovered instruction files into the request. It first gives them a strong framing paragraph:
+
+```text
+Codebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.
+```
+
+Then the request layer wraps them in a meta user message that looks like this:
+
+```xml
+<system-reminder>
+As you answer the user's questions, you can use the following context:
+# claudeMd
+...
+# currentDate
+...
+
+IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
+</system-reminder>
+```
+
+This two-step framing is important, but it is easy to misread without one extra clarification. The override language is about **assistant behavior relative to the default prompt**, not about overriding managed policy, permission checks, tool visibility, or sandboxing. The wrapper also carries a mix of material: some of it is binding repository guidance, some of it is opportunistic context such as dates or environment facts. Claude Code is expected to obey the guidance when it applies, while still ignoring irrelevant contextual filler instead of talking about it gratuitously.
+
+The second step keeps these materials out of the static base prompt, which helps preserve cache stability while still letting project-specific rules materially reshape behavior.
+
+## `/init` is the authoring path for many of these prompt assets
+
+Many of these instruction assets are created through `/init`, especially `CLAUDE.md`, `CLAUDE.local.md`, and related skill or hook scaffolding. The important point is architectural: Claude Code uses a prompt-driven workflow to generate future prompt-shaping artifacts instead of relying on a separate static scaffolder.
+
+Chapter 6 covers the command path in detail. From the perspective of context design, `/init` matters because it closes the loop between live repository exploration and durable instruction material that later sessions will load as high-priority context.
 
 ## Includes and path scoping
 
@@ -176,6 +310,27 @@ Important features of this subsystem include:
 
 This design reveals an important architectural boundary: durable memory is treated as a managed filesystem, not just as hidden model state.
 
+## The memory layer explains its own discipline
+
+The memory subsystem does not rely on vague advice such as "remember useful things." It injects a concrete operating guide. A representative excerpt begins:
+
+```text
+# auto memory
+
+You have a persistent, file-based memory system found at: `...`
+```
+
+and continues with explicit sections such as:
+
+```text
+## Types of memory
+## What NOT to save in memory
+## How to save memories
+## When to access memories
+```
+
+This is a revealing design choice. Claude Code is not asked to improvise a philosophy of memory each turn. It is given a file-management discipline: what kinds of things belong in memory, what does not belong there, where the entrypoint index lives, and how detailed memories should be organized underneath that index.
+
 ## Memory indexing versus memory content
 
 `memdir.ts` makes a subtle but important distinction between the **entrypoint index** and the actual memory files. `MEMORY.md` is intentionally treated as a navigation layer, while individual memory files hold the detailed content.
@@ -223,6 +378,28 @@ That hook-driven design has several benefits:
 - the subsystem can share token-counting logic with auto-compaction instead of inventing its own notion of context pressure
 
 In architectural terms, session memory is part of the maintenance layer around long-lived reasoning, not part of the visible turn contract.
+
+## Maintenance prompts are specialized workers, not loose reminders
+
+The session-memory updater receives a very different instruction surface from the ordinary coding loop. It is told, for example:
+
+```text
+IMPORTANT: This message and these instructions are NOT part of the actual user conversation...
+Your ONLY task is to use the Edit tool to update the notes file, then stop.
+...
+IMPORTANT: Always update "Current State" to reflect the most recent work...
+```
+
+The memory-extraction subagent receives an even narrower brief:
+
+```text
+You are now acting as the memory extraction subagent. Analyze the most recent ~N messages above and use them to update your persistent memory systems.
+...
+You MUST only use content from the last ~N messages to update your persistent memories.
+Do not waste any turns attempting to investigate or verify that content further...
+```
+
+These specialized prompts show that Claude Code treats memory maintenance as real operational work with its own contracts, not as an informal side effect of the main loop. The maintenance agents are given sharply bounded roles so they can update durable context without accidentally turning into general-purpose coding assistants.
 
 ## Attachments surface dynamic context without rewriting the whole prompt
 
@@ -272,7 +449,7 @@ flowchart TD
 
 ## Why context is broader than prompt assembly
 
-It is tempting to reduce this entire chapter to "how the prompt is built," but Claude Code is doing something richer. It is managing several kinds of remembered truth with different scopes:
+It is tempting to reduce this subsystem to "how the prompt is built," but Claude Code is doing something richer. It is managing several kinds of remembered truth with different scopes:
 
 - instruction truth
 - environment truth
@@ -283,6 +460,35 @@ It is tempting to reduce this entire chapter to "how the prompt is built," but C
 The runtime has to decide where each kind of truth belongs. That routing decision is one of the hidden sources of product quality.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified version of prompt assembly looks like this:
+
+```ts
+const defaultPrompt = [
+  intro,
+  taskRules,
+  toolRules,
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+  sessionGuidance,
+  memoryPrompt,
+  envInfo,
+  outputStyle,
+]
+
+const effectivePrompt =
+  overridePrompt ??
+  coordinatorPrompt ??
+  agentPrompt ??
+  customPrompt ??
+  defaultPrompt
+
+const system = appendSystemContext(effectivePrompt, systemContext)
+const messages = prependUserContext(history, userContext)
+```
+
+The important detail is not the exact array syntax; it is the separation of concerns. Claude Code chooses one effective prompt stack, appends operational system context to that stack, and injects user/project context as a separate meta message.
 
 ### Context is split deliberately across multiple channels
 

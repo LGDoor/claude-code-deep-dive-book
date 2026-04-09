@@ -69,6 +69,67 @@ Concrete examples of these buckets include:
 - **integration**: commands for MCP, plugins, bridge/remote, auth, or environment management
 - **inspection**: commands for context, cost, status, tasks, and session state
 
+## `/init` is a prompt-driven workflow, not a hard-coded generator
+
+One of the clearest examples of Claude Code's command philosophy is `/init`. At first glance, it looks like a conventional CLI bootstrap command that would procedurally generate files. Its implementation is more interesting than that.
+
+`/init` is registered in `src/commands.ts` as a **prompt command**, not as a local imperative command. That means the command does not primarily execute a fixed TypeScript workflow. Instead, `src/commands/init.ts` contributes a model-facing workflow prompt, and the normal query engine carries the rest.
+
+The new implementation begins with:
+
+```text
+Set up a minimal CLAUDE.md (and optionally skills and hooks) for this repo.
+```
+
+and then lays out an explicit multi-phase process:
+
+```text
+## Phase 1: Ask what to set up
+## Phase 2: Explore the codebase
+## Phase 3: Fill in the gaps
+## Phase 4: Write CLAUDE.md
+## Phase 5: Write CLAUDE.local.md
+## Phase 6: Suggest and create skills
+## Phase 7: Suggest additional optimizations
+## Phase 8: Summary and next steps
+```
+
+This is an important architectural clue. Claude Code implements `/init` mostly as a **workflow specification** written in prompt text. The command tells the model which tools to use, in what order, what questions to ask, and what artifacts to create. The runtime itself contributes only a thin shell around that process.
+
+## What the runtime does versus what the prompt does
+
+The TypeScript side of `/init` is intentionally small. It does three main things:
+
+1. registers the slash command and its description  
+2. marks project onboarding as complete when the command is invoked  
+3. chooses between the older simple prompt and the newer multi-phase prompt behind a feature gate
+
+The rest of the behavior lives in the prompt. That prompt instructs Claude Code to use existing mechanisms such as:
+
+- `AskUserQuestion` for setup choices and gap-filling interviews
+- subagents for repo survey work
+- ordinary read/search/edit/write tools to inspect the repository and create files
+- the `Skill` tool when hook setup needs the hook-construction reference flow
+
+This division of labor is revealing. `/init` is not a separate product subsystem with its own scaffolding engine. It is a curated orchestration layer built on top of the same command, tool, and prompt machinery used elsewhere in Claude Code.
+
+## `/init` flows through the ordinary slash-command pipeline
+
+`processSlashCommand.tsx` sends `/init` through the standard prompt-command path rather than a bespoke initializer path. The command's `getPromptForCommand()` result is wrapped into hidden model-visible messages, accompanied by command metadata, attachment extraction, and any tool-permission hints the command grants.
+
+That means `/init` is architecturally closer to a specialized prompt package than to a traditional shell subcommand. The user sees a simple slash command, but internally Claude Code is injecting a carefully prepared operating brief into the conversation and then letting the ordinary query engine execute it.
+
+## Why `/init` matters architecturally
+
+`/init` is valuable not only because it creates files, but because it shows how Claude Code prefers to build complex workflows:
+
+- keep the runtime primitive set small
+- express higher-level workflows as prompt-driven coordination over those primitives
+- reuse the same question-asking, delegation, and file-writing infrastructure
+- turn onboarding into durable context by materializing `CLAUDE.md`, `CLAUDE.local.md`, skills, and hooks
+
+In that sense, `/init` is a miniature of Claude Code itself. The command does not escape the architecture; it demonstrates it.
+
 ## Input routing pipeline
 
 ```mermaid
@@ -86,6 +147,21 @@ flowchart TD
 **Example:** `/clear` should run as a local command, while "clear the cache and explain what changed" should become a normal model-facing request, and a prompt with file references may collect attachments before send time. The same text box therefore feeds several different execution paths depending on how the input processor classifies the submission.
 
 The important idea is that submitted input is categorized before it becomes a model turn. That lets the CLI offer specialized behavior without forcing every action through the same path.
+
+## The submit order is more precise than the diagram suggests
+
+The real submission path is not "parse commands, then maybe add some extras." Its ordering is more specific:
+
+1. normalize pasted and inline image blocks
+2. apply bridge-origin rules for remotely sourced `/...` input
+3. rewrite ultraplan-style keyword prompts before ordinary dispatch
+4. load attachments for paths that are staying on the ordinary prompt path
+5. route explicit bash-mode input
+6. route real slash commands
+7. fall back to a regular prompt turn
+8. run `UserPromptSubmit` hooks only if the base path still intends to query
+
+That last point matters. Submit hooks are powerful, but they are not the first thing that touches every keystroke. They run after the base path has already decided that the input should become a query-producing turn.
 
 ## Prompt lifecycle
 
@@ -108,7 +184,7 @@ In practice, submission-time processing can also involve:
 - keyword-triggered rewrites such as ultraplan handling
 - hook execution that may block or enrich the prompt
 
-This makes the prompt lifecycle a coordination point between UX, policy, and execution.
+This makes the prompt lifecycle a coordination point between UX, policy, and execution. It also explains why one generic phrase like "submit-time hooks" can be misleading: some transformations happen before slash-command routing, while `UserPromptSubmit` hooks run only after the base input path has decided to continue into query execution.
 
 ## Submission-time enrichment
 
@@ -274,7 +350,7 @@ This is important because the command system is both a UX layer and an extension
 
 Because command availability can depend on bundled features, plugins, skills, or runtime posture, the command surface is partially composed at startup and during session life. This makes "what the user can do right now" a dynamic property of the session rather than a fixed product constant.
 
-That dynamic composition is visible in `src/commands.ts`, which mixes always-available commands, feature-gated branches, and later-loaded plugin/skill contributions into one effective registry.
+That dynamic composition is visible in `src/commands.ts`, which mixes always-available commands, feature-gated branches, and later-loaded plugin/skill contributions into one effective registry. Startup assembles the first usable snapshot of that registry, but later auth changes, plugin reloads, skill discovery, and cache invalidation can force it to be recomputed during session life.
 
 ## Why command loading stays lazy
 
@@ -302,6 +378,29 @@ The interaction layer is tightly coupled to application state for good reason. I
 That coupling is not accidental complexity; it is what lets the CLI behave like an operational cockpit rather than a bare shell.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified input-routing path looks like this:
+
+```ts
+const parsed = parseSlashCommand(input)
+
+if (!parsed) return submitConversationTurn(input)
+
+const command = getCommand(parsed.name)
+
+switch (command.type) {
+  case 'local':
+    return runLocalCommand(command, parsed.args)
+  case 'local-jsx':
+    return openOverlay(command, parsed.args)
+  case 'prompt':
+    return getMessagesForPromptSlashCommand(command, parsed.args, ctx)
+}
+```
+
+This is the key interaction trick in miniature. Claude Code does not treat every submitted string as ordinary conversation; it routes the same prompt box into local behavior, modal UI, or model-facing prompt generation depending on what the input processor decides.
 
 ### The submit handler is a policy point
 

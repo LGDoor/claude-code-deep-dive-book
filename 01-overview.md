@@ -81,6 +81,51 @@ These nouns matter because Claude Code repeatedly translates between them. For e
 - a **session** persists all of the above under one durable identity
 - **policy** shapes which of those transitions are even legal
 
+## One state model
+
+Claude Code keeps several overlapping state containers, each with a different durability boundary and operational role.
+
+| Thing | What it mainly holds | Typical lifetime |
+| --- | --- | --- |
+| **Session** | transcript, metadata, task references, cost, mode-related posture | multi-turn, resumable |
+| **Turn** | one user request plus the model/tool loop needed to settle it | one visible request |
+| **Task** | durable background handle for work that may finish later | until completion or explicit stop/retrieval |
+| **Agent / subagent** | a delegated execution context with its own prompt, tool scope, and transcript | per delegated assignment |
+| **Teammate** | the concrete swarm participant that carries a worker through a backend such as tmux, iTerm, or in-process execution | per coordinated team run, sometimes persisted for resume |
+| **Memory surface** | instruction files, auto memory, session memory, agent memory, and team memory | varies from one turn to long-lived |
+
+The important hierarchy is:
+
+- the **session** is the durable umbrella
+- a **turn** is one iteration inside that session
+- a **task** is a durable handle for ongoing work associated with the session
+- an **agent** is the delegated worker logic
+- a **teammate** is the concrete swarm carrier for that worker when coordination is involved
+
+That distinction matters because the same ongoing work can appear in several subsystems at once. A background worker can be an **agent** from the tool layer, a **task** from the durability layer, and a **teammate** from the swarm layer without those words meaning the same thing.
+
+## The word `mode` names four different things
+
+One source of confusion in Claude Code is that the same everyday word is reused for several different runtime ideas.
+
+| Mode family | Typical examples | What it changes |
+| --- | --- | --- |
+| **Execution mode** | interactive, non-interactive, remote/viewer, bridge | shell, transport, and I/O contract |
+| **Permission mode** | `default`, `plan`, `acceptEdits`, `bypassPermissions`, `dontAsk`, `auto` | how tool requests are approved, denied, or automated |
+| **Prompt identity** | default, custom, agent, coordinator, proactive addendum | what Claude Code is told it is and how it should behave |
+| **Session-stable latches** | AFK header latch, fast-mode latch, cache-editing latch, thinking-clear latch | whether prompt-shaping headers stay sticky for cache stability |
+
+These narrower terms matter because Claude Code controls them through different subsystems. Prompt assembly determines **prompt identity**, the safety layer determines **permission mode**, and startup/bootstrap logic determines **execution mode** and session-stable runtime posture.
+
+## Two kinds of authority
+
+Claude Code also has two different kinds of authority that should not be blended:
+
+- **reasoning authority** shapes what the model is told: system prompt selection, command prompts, `CLAUDE.md`, tool descriptions, and dynamic attachments
+- **execution authority** shapes what the runtime will actually permit: settings, managed policy, permission rules, and sandbox boundaries
+
+This distinction keeps prompt construction and runtime enforcement from being conflated. Claude Code may be instructed to prefer a workflow by prompt and repository guidance, while the runtime still reserves the right to deny or sandbox the corresponding action.
+
 ## System context
 
 ```mermaid
@@ -114,7 +159,7 @@ flowchart TD
   PERSIST --> UX
 ```
 
-The key idea is that the conversation layer sits in the middle. It mediates between user intent, available capabilities, and durable state. That is why so many later chapters converge on `QueryEngine`, `query.ts`, and their surrounding utilities.
+The key idea is that the conversation layer sits in the middle. It mediates between user intent, available capabilities, and durable state. That central role is why `QueryEngine`, `query.ts`, and their surrounding utilities keep reappearing across the architecture.
 
 ## How the major subsystems interact
 
@@ -334,55 +379,49 @@ It also explains why Claude Code cares so much about:
 - remote and bridge operation instead of only local interaction
 - cumulative cost and telemetry instead of only per-request stats
 
+## A representative whole-system sketch
+
+A simplified shape of Claude Code's runtime looks like this:
+
+```ts
+const input = readUserInput()
+
+const routed = routeInput(input, {
+  commands,
+  attachments,
+  currentMode,
+})
+
+const context = buildContext({
+  session,
+  promptAssets,
+  tools,
+  permissions,
+})
+
+const result = await runQueryLoop(routed, context)
+
+await persistSession({
+  messages: result.messages,
+  tasks: result.tasks,
+  metadata: result.metadata,
+})
+
+renderToUser(result)
+```
+
+This is intentionally simplified, but it captures the most important architectural rhythm: Claude Code routes input, assembles context, runs the query/tool loop, persists the resulting session state, and only then projects the result back through the UI. Later chapters zoom in on each line of that sketch.
+
 ## Repository-wide design themes
 
-### Feature-gated architecture
+A few design themes recur across Claude Code:
 
-Claude Code aggressively uses compile-time and runtime gating. This allows one runtime to produce multiple product shapes with different capability surfaces.
-
-### Session durability
-
-A session is treated as a recoverable unit of work. Conversations, metadata, tasks, and related state are designed to survive interruptions, restarts, and long-running usage.
-
-### Layered extensibility
-
-The system supports multiple extension forms:
-
-- plugins
-- skills
-- MCP servers
-- custom agents
-- dynamic commands and hooks
-
-Each extends the assistant in a different way, but they are designed to fit within the same safety and execution framework.
-
-### Explicit runtime boundaries
-
-Claude Code repeatedly uses boundary objects and registries rather than direct ad hoc calls. Examples include:
-
-- tool registries
-- permission contexts
-- bootstrap state
-- session storage and recovery helpers
-- provider/client abstractions
-
-This is a sign that the system is optimized for composition and product variation, not just for a single happy-path control flow.
-
-### Shared abstractions across local and remote paths
-
-Claude Code repeatedly tries to avoid building separate conceptual systems for local and remote use. Sessions, tools, tasks, messages, and permissions are reused across channels as much as possible. This reduces fragmentation and is a recurring architectural strength.
-
-### Capability through composition
-
-Instead of concentrating all functionality in one mega-engine, the system composes capability from:
-
-- tool inventories
-- command registries
-- provider layers
-- extension loaders
-- session and policy context
-
-That makes the runtime adaptable, but it also means understanding the final behavior often requires understanding how several registries combine.
+- **Feature-gated product shape:** one codebase can assemble several runtime personalities.
+- **Session durability:** conversations, tasks, and operational metadata are treated as recoverable work state.
+- **Layered extensibility:** plugins, skills, MCP servers, hooks, and custom agents extend the same guarded runtime rather than forming separate mini-platforms.
+- **Boundary-heavy composition:** registries and context objects keep optional branches composable and reduce ad hoc coupling.
+- **Shared abstractions across transports:** sessions, tools, tasks, and permissions are reused across local, remote, and delegated paths.
+- **Capability through composition:** behavior emerges from how command registries, tool inventories, provider layers, extension loaders, and policy context combine.
 
 ## Architectural tensions
 
@@ -396,14 +435,4 @@ Several tensions shape Claude Code:
 | Extensibility vs coherence | plugins, skills, MCP, and custom agents must fit a common execution model |
 | Long-lived sessions vs bounded context | persistence and compaction must work together |
 
-## What the rest of the book covers
-
-- Chapter 2 explains the query engine and conversation lifecycle.
-- Chapter 3 explains how context, memory, and prompt assets are assembled and maintained.
-- Chapters 4 and 5 explain tool execution and the safety boundary around it.
-- Chapters 6 and 7 explain how the agent is surfaced to users and how the runtime starts.
-- Chapters 8 through 10 explain extensibility, durable session work, and multi-agent coordination.
-- Chapter 11 explains the operational concerns that shape the build and runtime.
-- Chapter 12 closes by restating the architectural thesis that connects those subsystems into one design.
-
-By the end of the book, the most important architectural idea should be clear: Claude Code is a session-oriented orchestration system that happens to wear a CLI interface, not merely a CLI that happens to call a language model.
+Taken together, those themes and tensions point to the same conclusion: Claude Code is a session-oriented orchestration system that happens to wear a CLI interface, not merely a CLI that happens to call a language model.

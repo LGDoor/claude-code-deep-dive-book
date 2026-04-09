@@ -236,6 +236,33 @@ flowchart LR
   REG --> MCPR[MCP connections]
 ```
 
+## Most extension conflicts are avoided by namespacing
+
+One reason the extension story stays manageable is that Claude Code often avoids collisions instead of trying to pick one universal winner after the fact.
+
+| Surface | Main conflict strategy |
+| --- | --- |
+| **Plugin commands and agents** | plugin identity is baked into naming or loading, so collisions are usually namespaced rather than silently overridden |
+| **Plugin MCP servers** | plugin-supplied MCP servers are namespaced and merged into the broader MCP config instead of pretending to be anonymous global servers |
+| **Skills** | layered directory loading plus path depth decides which project-local skill definition is more specific |
+| **Agent definitions** | when two definitions truly share an `agentType`, later and more user-controlled sources win |
+
+This gives Claude Code a more legible rule set than "extensions fight it out in one global map." The runtime prefers **separation first, precedence second**.
+
+## When precedence really matters
+
+Not every surface can be solved by namespacing alone. When Claude Code does need a precedence story, it tends to follow one of three patterns:
+
+1. **more authoritative config wins**, especially when managed or user-provided sources sit above built-ins
+2. **more specific project-local content wins**, especially for skills discovered deeper in the active directory tree
+3. **availability is recomputed late**, so a command or agent may still disappear after loading if auth, policy, or runtime enablement says it should
+
+This is why extension loading feels like reconciliation rather than simple discovery. The runtime is not merely finding new things; it is deciding which newly found things are authoritative, which should be hidden, and which should coexist by naming rather than by override.
+
+The command surface is a good concrete example. Claude Code builds a mixed inventory from bundled skills, built-in plugin skills, skill-directory skills, workflow-derived commands, plugin commands, plugin-provided skills, and built-ins, then reapplies availability and enablement checks late so auth and policy can still hide entries after loading. So even here the story is not "last array element wins"; it is "assemble, then reconcile."
+
+The same pattern appears elsewhere. A custom or user-provided agent definition can replace a built-in one of the same type, while plugin-defined MCP servers and commands are more often namespaced so they coexist instead of override. This is why Claude Code's extensibility story feels layered rather than competitive.
+
 ## LSP and language-aware integration
 
 The presence of LSP-specific tooling shows that Claude Code is not limited to generic shell/file operations. It can integrate with richer semantic tooling where available, improving code navigation and language-aware assistance.
@@ -246,7 +273,7 @@ That distinction matters. LSP is an enrichment layer for better semantic context
 
 ## Integrations as capability layers, not feature checkboxes
 
-The most important lesson from this chapter is that integrations add different kinds of value:
+The most important architectural lesson is that integrations add different kinds of value:
 
 - providers make the core engine portable
 - MCP makes external capability attachable
@@ -260,6 +287,23 @@ Seeing them as layers clarifies why Claude Code keeps them distinct.
 It also clarifies why they are allowed to overlap. A plugin may declare MCP servers; a skill may be surfaced through commands; an agent may use MCP-backed tools. The system is layered, but not artificially siloed.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified extensibility assembly path looks like this:
+
+```ts
+const provider = selectProvider(auth, settings)
+const mcpConfigs = mergeMcpConfigs(policy, plugins, settings, remote)
+
+const pluginCommands = loadPluginCommands()
+const skillCommands = await loadSkillCommands(cwd)
+
+const tools = assembleToolPool(permissionContext, mcpConfigs.tools)
+const commands = [...builtIns, ...pluginCommands, ...skillCommands]
+```
+
+This is not the exact code, but it captures the layering logic. Claude Code chooses a provider, reconciles external capability sources, and then projects those sources back into the core abstractions of tools and commands rather than inventing separate execution pathways for each extension type.
 
 ### Provider support is a portability layer
 

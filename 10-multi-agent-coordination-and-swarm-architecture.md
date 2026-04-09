@@ -12,7 +12,7 @@ That matters because the jump from one agent to many is not just a scaling trick
 - backends may be process-local or pane-based
 - worker output must be visible without becoming ordinary user conversation
 
-This topic deserves its own chapter because the existing chapters describe agents, tasks, and sessions, but the **coordinator/team topology** is more than the sum of those parts. It is an alternate execution model.
+The **coordinator/team topology** is more than the sum of agents, tasks, and sessions. It is an alternate execution model.
 
 ## Core implementation surfaces
 
@@ -36,7 +36,7 @@ The coordinator path is not just "the same assistant, but more willing to call t
 
 This is an important distinction. Coordinator mode turns the main agent from a direct executor into a **manager of other execution contexts**.
 
-Throughout this chapter, **coordinator** is the primary term for the main supervising thread. When permission-sync or mailbox paths use the word **leader**, they refer to that same coordinator seen from the authority side of the workflow. **Worker** is the generic term for a subordinate execution unit. **Agent** names the model-backed role being launched, while **teammate** names the concrete swarm participant - pane-based or in-process - that carries that worker through the runtime.
+Here, **coordinator** is the primary term for the main supervising thread. When permission-sync or mailbox paths use the word **leader**, they refer to that same coordinator seen from the authority side of the workflow. **Worker** is the generic term for a subordinate execution unit. **Agent** names the model-backed role being launched, while **teammate** names the concrete swarm participant - pane-based or in-process - that carries that worker through the runtime.
 
 ## The coordinator prompt defines a workflow model
 
@@ -51,6 +51,46 @@ It also encodes concurrency guidance, worker-prompt guidance, and rules for when
 
 This means the multi-agent architecture is not just runtime plumbing. It includes a product-level operating model for how delegated work should be structured.
 
+## The coordinator prompt reads like an operating manual
+
+The coordinator prompt does not sound like a generic assistant prompt with one extra sentence about workers. It begins with an explicit identity shift:
+
+```text
+You are Claude Code, an AI assistant that orchestrates software engineering tasks across multiple workers.
+
+## 1. Your Role
+You are a coordinator. Your job is to:
+- Help the user achieve their goal
+- Direct workers to research, implement and verify code changes
+- Synthesize results and communicate with the user
+```
+
+It then encodes a workflow model directly in prompt text:
+
+```text
+## 4. Task Workflow
+Research | Synthesis | Implementation | Verification
+```
+
+and gives a memorable concurrency rule:
+
+```text
+Parallelism is your superpower. Workers are async. Launch independent workers concurrently whenever possible ...
+```
+
+Even the worker-result protocol is specified in the coordinator prompt itself:
+
+```xml
+<task-notification>
+<task-id>{agentId}</task-id>
+<status>completed|failed|killed</status>
+<summary>{human-readable status summary}</summary>
+<result>{agent's final text response}</result>
+</task-notification>
+```
+
+This is worth emphasizing because it shows that coordinator mode is not just an implementation trick layered over the same old agent behavior. The prompt defines a management role, a workflow, and a mailbox protocol. The multi-agent architecture is therefore partly encoded in process topology and partly encoded in the coordinator's own operating manual.
+
 ## Delegation is broader than one worker type
 
 Claude Code actually contains several delegation patterns that are easy to blur together but are architecturally distinct:
@@ -63,6 +103,20 @@ Claude Code actually contains several delegation patterns that are easy to blur 
 | Background worker or task | let work continue asynchronously with later retrieval | long-running operations that should outlive the current visible turn |
 
 Claude Code treats these forms differently because they have different tradeoffs around context inheritance, result retrieval, and lifecycle control.
+
+## Worker-type choice is a coordination decision
+
+Coordinator-style delegation is not only a question of how many workers to launch. It is also a question of **which worker type** to launch for each phase.
+
+In practice, Claude Code distinguishes at least these broad roles:
+
+- **general-purpose workers** for open-ended implementation or mixed research-and-edit work
+- **Explore-style workers** for fast read-only search and codebase discovery
+- **Plan-style workers** for read-only architectural planning
+- **verification workers** for adversarial checking after implementation
+- **forked workers** when continuity with the current thread matters more than fresh specialization
+
+This is why the coordinator architecture feels more like work routing than mere parallelism. The coordinator is not only deciding who works next; it is assigning the right execution posture for the job. Chapter 4 describes the underlying typed delegation surface in more detail. Here the key point is that multi-agent coordination depends on those types being meaningfully different.
 
 ## Agent definitions are loaded, filtered, and specialized
 
@@ -98,6 +152,16 @@ Coordinator mode does not rely on free-form worker chatter alone. It defines str
 - a worker that has produced a final result worth synthesizing
 
 This is why the coordinator can behave like a manager rather than like a passive transcript reader. The result channel carries enough structure for the coordinator to make orchestration decisions.
+
+## Mailbox, task notification, and transcript are different layers
+
+One worker can project itself through several channels at once, and each serves a different job:
+
+- the **mailbox layer** carries teammate-to-teammate coordination, permission requests, and other asynchronous control messages
+- the **task-notification layer** tells the coordinator that a worker is running, waiting, completed, or failed, often alongside a final result summary
+- the **transcript layer** preserves the worker's own detailed history separately from the parent conversation
+
+This is why worker output can feel both visible and hidden at the same time. Claude Code does not dump every worker event into the parent transcript. It keeps full worker history in worker artifacts, while surfacing only the structured summary that the coordinator actually needs.
 
 ## Teammate identity is a first-class runtime concept
 
@@ -255,25 +319,24 @@ In other words, a swarm is not only a set of running agents. It is also a descri
 
 This makes team state durable enough for recovery, cleanup, and cross-process coordination. It also means the swarm architecture is legible from the filesystem, not just from transient runtime objects.
 
-## Team memory extends coordination beyond one turn
+## Team memory is coordination memory
 
-The presence of team-memory-specific paths and synchronization services shows that a swarm is not only a way to parallelize current work. It is also a way to build and reuse shared knowledge among teammates.
+The team-memory paths show that a swarm is not only a way to parallelize current work. Claude Code also persists knowledge that belongs to the collaboration itself, so teammates can reuse coordination context across turns or later resumes.
 
-This is a qualitatively different concept from ordinary session memory:
+That is a narrower concern than the broader memory taxonomy in Chapter 3. Here the important split is local versus shared specialization:
 
-- session memory summarizes one session's evolving state
-- team memory supports cross-teammate or repeated collaborative knowledge
+- **agent memory** keeps durable role-specific guidance with a given agent type
+- **team memory** keeps durable coordination context that several workers may need to share
 
-That distinction matters because it turns multi-agent work from mere concurrency into a more persistent coordination model.
+More concretely, team memory is **repo-shared memory** stored under the auto-memory tree's `team/` area and synchronized as a shared project-scoped surface for collaborators working on the same repository context. It is therefore different from:
 
-## Agent memory and team memory solve different problems
+- **agent memory**, which is tied to one agent definition and loaded into that agent's prompt
+- **session memory**, which is one session's evolving continuity note
+- **repo-shared team memory**, which is intended to survive beyond one worker and be visible to collaborators working on the same repository context
 
-Claude Code supports both agent-scoped memory and team-scoped memory because specialization happens at more than one level.
+That extra concreteness matters because "shared memory" can otherwise sound mystical. In Claude Code it is still a file-backed, scoped, synchronizable artifact.
 
-- **agent memory** helps a particular agent type carry durable role-specific guidance
-- **team memory** helps a collection of workers share durable coordination context
-
-This split is important. A code-review worker and a planning worker may need different long-lived local guidance even when they participate in the same team.
+This distinction is what makes swarm work feel like durable collaboration rather than a burst of parallel subprocesses.
 
 ## Swarm topology
 
@@ -322,6 +385,28 @@ The opposite mistake is to think that swarms are only the agent tool used more o
 This is what turns delegation into a topology rather than a one-off tool call.
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified coordinator path looks like this:
+
+```ts
+const workers = [
+  Agent({ subagent_type: 'Explore', description: 'trace auth flow', prompt: '...' }),
+  Agent({ subagent_type: 'Plan', description: 'design fix', prompt: '...' }),
+]
+
+for (const note of taskNotifications) {
+  coordinator.record(note.taskId, note.status)
+  if (note.status === 'completed') coordinator.synthesize(note.result)
+}
+
+if (workerNeedsApproval) {
+  forwardPermissionRequest(workerId, coordinatorId)
+}
+```
+
+This sketch compresses a lot of machinery, but it shows the key topology: the coordinator launches typed workers, receives structured completion signals, and may also act as the authority boundary for worker-side permission requests.
 
 ### Coordinator mode changes the main thread's job
 

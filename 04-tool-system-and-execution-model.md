@@ -58,6 +58,45 @@ Schemas are not just for input validation. In this architecture they also serve 
 
 That makes the schema layer one of the important meeting points between model reasoning and runtime enforcement.
 
+## Tool descriptions are themselves prompt text
+
+In Claude Code, a tool definition is not only executable metadata. Its description is part of the model-facing request envelope. Representative excerpts make this plain.
+
+The Read tool teaches the model how file access should work:
+
+```text
+Reads a file from the local filesystem.
+- The file_path parameter must be an absolute path, not a relative path
+- Results are returned using cat -n format, with line numbers starting at 1
+```
+
+The Edit tool teaches a workflow, not just an API:
+
+```text
+Performs exact string replacements in files.
+- You must use your `Read` tool at least once in the conversation before editing.
+- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
+```
+
+The Agent tool teaches delegation discipline:
+
+```text
+Launch a new agent to handle complex, multi-step tasks autonomously.
+...
+Never delegate understanding.
+```
+
+The Bash tool goes even further and embeds policy-heavy operating guidance:
+
+```text
+# Git operations
+IMPORTANT: NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it.
+```
+
+This matters because tool design in Claude Code is partly prompt design. A tool description does not merely explain a capability after the fact; it shapes how the model plans, which tool it prefers, and how cautiously it approaches side effects.
+
+Another consequence is that tool-registry changes can alter prompt stability even when no execution code changes. This is why Claude Code sometimes moves dynamic capability listings, such as the available agent list, out of static tool descriptions and into message attachments. The goal is not only correctness, but also a more stable request envelope.
+
 ## Tool categories
 
 ```mermaid
@@ -236,6 +275,8 @@ Result mapping is where the runtime translates from "a tool completed" into "the
 
 This translation step is what lets tools participate naturally in the conversation model.
 
+That mapped artifact is also the exact handoff point into the broader runtime. The query engine persists it, the UI renders it, and the next model iteration reasons over it. The tool layer therefore does not return an internal value to some hidden caller; it manufactures the durable message-shaped evidence that becomes transcript history.
+
 ## Tools as the base for higher-level concepts
 
 Several major product features are "tools in different clothes":
@@ -247,6 +288,88 @@ Several major product features are "tools in different clothes":
 Agent tools delegate work to subordinate execution contexts. This allows the system to spawn specialized workers without inventing a second execution model.
 
 This chapter focuses on the shared tool contract that makes those launches possible. The coordinator/team topology that sits on top of agent tools is covered separately in Chapter 10.
+
+## The delegated task surface is typed, not generic
+
+One important omission in many high-level summaries of Claude Code is that delegated work is not just "spawn an agent." The delegated task surface has **distinct agent types**, each with a different prompt, tool budget, and intended role.
+
+The most important built-in types are:
+
+| Type | Main role | Tool posture | Representative prompt idea |
+| --- | --- | --- | --- |
+| `general-purpose` | open-ended research and implementation | full capability | "complete the task fully" |
+| `Explore` | fast read-only codebase exploration | read/search only | "READ-ONLY exploration task" |
+| `Plan` | architecture and implementation planning | read/search only | "planning specialist" |
+| `verification` | adversarial post-implementation checking | no project edits, evidence-heavy checking | "try to break it" |
+| forked worker | branch the current thread with inherited context | inherits parent context/tool pool | directive-style continuation rather than fresh briefing |
+
+In other words, Claude Code does not treat delegation as a single background-execution primitive. It treats it as a small type system for work.
+
+## The Agent tool prompt teaches the type system
+
+The Agent tool prompt itself makes the typed nature of delegation visible. It tells the model:
+
+```text
+When using the Agent tool, specify a subagent_type to use a specialized agent, or omit it to fork yourself ...
+```
+
+That sentence is doing more architectural work than it first appears to. It defines two major delegation families:
+
+1. **fresh specialized agents**, which start with a role-specific prompt and little or no inherited context  
+2. **forks**, which inherit the caller's live context and therefore behave more like a branch of current work than a new specialist
+
+The prompt then adds a principle that is central to typed delegation:
+
+```text
+Never delegate understanding.
+```
+
+That rule matters because Claude Code is not supposed to use agent types as a way to avoid synthesis. The parent chooses the worker type, scopes the assignment, and remains responsible for understanding the returned result.
+
+## The built-in agent types express different philosophies of work
+
+The built-in prompts make the distinction even clearer.
+
+The general-purpose agent is the broad executor:
+
+```text
+General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks.
+```
+
+The Explore agent is explicitly read-only and speed-oriented:
+
+```text
+You are a file search specialist ...
+=== CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
+```
+
+The Plan agent is also read-only, but it trades speed for design discipline:
+
+```text
+You are a software architect and planning specialist ...
+Your role is EXCLUSIVELY to explore the codebase and design implementation plans.
+```
+
+The verification agent is the most opinionated of the group:
+
+```text
+You are a verification specialist. Your job is not to confirm the implementation works — it's to try to break it.
+```
+
+This is a particularly important agent type because it proves Claude Code does not model all delegated work as "help me do more of the same." Verification is framed as adversarial evidence gathering with a required verdict format, not as friendly assistance to the implementer.
+
+## Choosing the type is part of the architecture
+
+The TeamCreate prompt summarizes the practical consequence of this type system:
+
+```text
+- Read-only agents (e.g., Explore, Plan) cannot edit or write files.
+- Full-capability agents (e.g., general-purpose) have access to all tools including file editing, writing, and bash.
+```
+
+That distinction is architecturally important because it means delegated work is shaped before execution begins. Claude Code decides not only **that** some work should be delegated, but also **what kind of worker** should hold it, whether that worker should be allowed to mutate the repository, and whether the assignment is research, planning, implementation, or verification.
+
+Seen this way, the "task tool" surface is really a typed orchestration interface. The user may experience it as one delegation feature, but the runtime experiences it as a choice among different execution roles with different cognitive and safety contracts.
 
 ### Skills
 
@@ -281,6 +404,26 @@ Without this reuse, Claude Code would likely fragment into several incompatible 
 | Plan/worktree tools | explicit runtime state transitions rather than ordinary file or shell work |
 
 ## Important implementation details
+
+### Representative logic sketch
+
+A simplified tool invocation pipeline looks like this:
+
+```ts
+const tool = resolveTool(request.name)
+const input = tool.inputSchema.parse(request.arguments)
+
+await checkPermissions(tool, input, ctx)
+await runPreToolHooks(tool, input, ctx)
+
+const rawResult = await tool.call(input, ctx)
+const messages = mapToolResultToConversation(tool, rawResult, ctx)
+
+await runPostToolHooks(tool, rawResult, ctx)
+return messages
+```
+
+The actual runtime carries more state than this sketch shows, but the structure matters: a tool call is resolved, validated, permission-checked, hook-wrapped, executed, and translated back into conversation artifacts rather than returned as an isolated function value.
 
 ### Tool defaults are centralized
 
